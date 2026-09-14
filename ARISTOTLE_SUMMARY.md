@@ -1,0 +1,2 @@
+# Summary of changes for run b4751aa7-9d44-42ea-a20f-b9a52f74f07d
+I formalized and proved the statement in `Qed/Basic.lean`. A run of the quantity is modeled as a sequence `q : ℕ → ℤ` with `q 0 = 1000000000` and, at each step, either `q (n+1) = q n` or `q (n+1) = q n - d` for some positive integer `d` (`Qed.IsValidRun`). The main theorem `Qed.le_initialValue` shows that for every `n`, `q n ≤ 1000000000`; it follows by induction from the auxiliary step lemma that each operation is non-increasing. The project builds cleanly with no `sorry` and no extra axioms.
