@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proof → Stamp → Coin.</title>
+<meta name="description" content="Verify the test2 launch: a Lean proof, its SHA-256 fingerprint stamped on Robinhood Chain, then the launchpad launch.">
+<style>
+  :root { color-scheme: dark; --bg:#000; --fg:#e6e6e6; --dim:#8b949e; --line:#262c33; --ok:#3fb950; --bad:#f85149; --link:#79c0ff; --card:#0a0c0f; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; background:var(--bg); color:var(--fg); font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  body { padding: 40px 16px 80px; }
+  main { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 26px; font-weight: 600; letter-spacing: .02em; margin: 0 0 6px; }
+  .sub { color: var(--dim); margin: 0 0 40px; }
+  section { border-top: 1px solid var(--line); padding: 28px 0; }
+  h2 { font-size: 14px; font-weight: 600; margin: 0 0 14px; color: var(--fg); }
+  h2 .n { color: var(--dim); margin-right: 10px; }
+  pre { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 0; font-size: 13px; line-height: 1.5; }
+  code { color: #d2a8ff; }
+  .hash { word-break: break-all; color: #fff; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; align-items: baseline; }
+  .kv .k { color: var(--dim); white-space: nowrap; }
+  .kv .v { word-break: break-all; min-width: 0; }
+  @media (max-width: 560px) { .kv { grid-template-columns: 1fr; gap: 2px 0; } .kv .v { margin-bottom: 10px; } }
+  a { color: var(--link); text-decoration: none; } a:hover { text-decoration: underline; }
+  button { font: inherit; background: #161b22; color: var(--fg); border: 1px solid #30363d; border-radius: 6px; padding: 8px 14px; cursor: pointer; margin-top: 12px; }
+  button:hover { border-color: #8b949e; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .dim { color: var(--dim); }
+  .badge { display: inline-block; margin-left: 8px; }
+  .steps { margin: 14px 0 0; padding: 0; list-style: none; counter-reset: s; }
+  .steps li { padding: 6px 0; } .steps b { color: #fff; display: inline-block; min-width: 88px; }
+  .summary { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; margin: 10px 0 18px; color: #c9d1d9; }
+  footer { border-top: 1px solid var(--line); padding-top: 20px; color: var(--dim); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Proof → Stamp → Coin.</h1>
+  <p class="sub">test2 / $TESTII on Robinhood Chain (chain id 4663). A machine-checked Lean proof was hashed, the hash was stamped on-chain, and only then was the token launched.</p>
+
+  <section id="proof">
+    <h2><span class="n">1</span>The proof: <code>Qed/Basic.lean</code></h2>
+    <pre id="proof-view"></pre>
+    <script type="text/plain" id="proof-src">import Mathlib
+
+/-!
+# Monotone decrease from a fixed starting value
+
+We model a quantity evolving in discrete steps as a function `q : ℕ → ℤ`, where
+`q n` is its value after `n` operations.  The quantity starts at `1000000000`,
+and each operation either leaves it unchanged or decreases it by a positive
+integer.  We prove that after any finite number of operations the quantity is at
+most `1000000000`.
+-/
+
+namespace Qed
+
+/-- The starting value of the quantity. -/
+def initialValue : ℤ := 1000000000
+
+/-- `IsValidRun q` says that `q : ℕ → ℤ` describes the evolution of the quantity:
+it starts at `initialValue`, and each step either leaves the value unchanged or
+decreases it by some positive integer. -/
+def IsValidRun (q : ℕ → ℤ) : Prop :=
+  q 0 = initialValue ∧
+  ∀ n : ℕ, q (n + 1) = q n ∨ ∃ d : ℤ, 0 < d ∧ q (n + 1) = q n - d
+
+/-- Each step of a valid run does not increase the quantity. -/
+theorem step_le {q : ℕ → ℤ} (hq : IsValidRun q) (n : ℕ) : q (n + 1) ≤ q n := by
+  rcases hq.2 n with h | ⟨d, hd, h⟩
+  · exact le_of_eq h
+  · omega
+
+/-- After any finite sequence of operations the quantity is at most `1000000000`. -/
+theorem le_initialValue {q : ℕ → ℤ} (hq : IsValidRun q) (n : ℕ) :
+    q n ≤ initialValue := by
+  induction n with
+  | zero => exact le_of_eq hq.1
+  | succ k ih => exact (step_le hq k).trans ih
+
+end Qed
+</script>
+  </section>
+
+  <section id="fingerprint">
+    <h2><span class="n">2</span>Its SHA-256 fingerprint</h2>
+    <div class="kv">
+      <div class="k">recorded</div><div class="v hash" id="recorded-hash">77f733e0ae4731d100ab2815af200f290fc66a266a707bf5c8e365b364baf2cf</div>
+      <div class="k">in your browser</div><div class="v hash" id="computed-hash"><span class="dim">press the button to hash the file shown above</span></div>
+    </div>
+    <button id="recompute">Recompute SHA-256 from the file above</button>
+    <div id="hash-status" class="dim" style="margin-top:8px"></div>
+  </section>
+
+  <section id="anchor">
+    <h2><span class="n">3</span>The stamp: anchor transaction</h2>
+    <div class="kv">
+      <div class="k">tx</div><div class="v"><a href="https://robinhoodchain.blockscout.com/tx/0xa524634ec0f99cf1b271bbd4dcdd6e17acefd6d83995a185351ed48c02bb51cf" target="_blank" rel="noopener">0xa524634ec0f99cf1b271bbd4dcdd6e17acefd6d83995a185351ed48c02bb51cf</a></div>
+      <div class="k">block</div><div class="v">63,007,508</div>
+      <div class="k">shape</div><div class="v">0 ETH, sender → sender, calldata = the fingerprint</div>
+      <div class="k">fingerprint</div><div class="v hash">77f733e0ae4731d100ab2815af200f290fc66a266a707bf5c8e365b364baf2cf</div>
+      <div class="k">on-chain input</div><div class="v hash" id="anchor-input"><span class="dim">fetching from RPC…</span></div>
+    </div>
+    <div id="anchor-status" style="margin-top:8px" class="dim"></div>
+  </section>
+
+  <section id="launch">
+    <h2><span class="n">4</span>The coin: launch transaction</h2>
+    <div class="kv">
+      <div class="k">tx</div><div class="v"><a href="https://robinhoodchain.blockscout.com/tx/0xa0ba80fa706e06fa9c8eb0aaf78e5ace7a8c0b89cb36f71d384e582b42f29f97" target="_blank" rel="noopener">0xa0ba80fa706e06fa9c8eb0aaf78e5ace7a8c0b89cb36f71d384e582b42f29f97</a></div>
+      <div class="k">block</div><div class="v"><span id="launch-block">63,007,700</span></div>
+      <div class="k">order</div><div class="v" id="order">launch block 63,007,700 &gt; anchor block 63,007,508 <span class="ok badge">✓ stamped before launched</span></div>
+      <div class="k">token</div><div class="v"><a href="https://launchpad.example/tokens/0x666ed8c77f43ec1536308ce2bc1fa2e777431e18" target="_blank" rel="noopener">0x666ed8c77f43ec1536308ce2bc1fa2e777431e18</a> <span class="dim">test2 / TESTII, paired with SPCX</span></div>
+      <div class="k">via</div><div class="v">launchpad factory <span class="dim">0x1Eef016F22A943abC7DD11422EDeE9D235942104</span></div>
+    </div>
+    <div id="launch-status" style="margin-top:8px" class="dim"></div>
+  </section>
+
+  <section id="aristotle">
+    <h2><span class="n">5</span>Aristotle (Harmonic) verification</h2>
+    <div class="kv">
+      <div class="k">task, original proof</div><div class="v">b4751aa7-9d44-42ea-a20f-b9a52f74f07d <span class="dim">project cc840c38-fef3-47f2-943f-3d5ea124127d</span></div>
+    </div>
+    <div class="summary">I formalized and proved the statement in <code>Qed/Basic.lean</code>. A run of the quantity is modeled as a sequence <code>q : ℕ → ℤ</code> with <code>q 0 = 1000000000</code> and, at each step, either <code>q (n+1) = q n</code> or <code>q (n+1) = q n - d</code> for some positive integer <code>d</code> (<code>Qed.IsValidRun</code>). The main theorem <code>Qed.le_initialValue</code> shows that for every <code>n</code>, <code>q n ≤ 1000000000</code>; it follows by induction from the auxiliary step lemma that each operation is non-increasing. The project builds cleanly with no <code>sorry</code> and no extra axioms.</div>
+    <div class="kv">
+      <div class="k">task, at launch time</div><div class="v">63143c04-5e9b-4572-8bff-304349a3fdd1 <span class="dim">project e1e90f7d-9079-4fbc-902b-099062a705b6</span></div>
+    </div>
+    <div class="summary">I verified <code>Qed/Basic.lean</code> as submitted. The file builds cleanly against the project&#x27;s Mathlib pin with no errors and no warnings, and it contains no <code>sorry</code>, <code>admit</code>, or <code>axiom</code> declarations. Both theorems were already complete and correct, so no changes to any definition, statement, or proof were needed:<br>- <code>Qed.step_le</code>: each step of a valid run does not increase the quantity (case split on the &quot;unchanged&quot; vs. &quot;decrease by a positive integer&quot; alternative).<br>- <code>Qed.le_initialValue</code>: after any finite number of operations, the quantity is at most <code>1000000000</code> (induction on the number of steps, chaining <code>step_le</code> with the initial condition).<br>I additionally checked the transitive axiom dependencies of both theorems: each uses only <code>propext</code>, <code>Classical.choice</code>, and <code>Quot.sound</code>, i.e. no axioms beyond the Lean/Mathlib standard set. The working tree is unchanged relative to the existing commit, so no new commit was required.</div>
+  </section>
+
+  <section id="pipeline">
+    <h2><span class="n">6</span>The pipeline: <a href="https://github.com/QEDRH/qed/blob/main/deploy.py" target="_blank" rel="noopener">deploy.py</a></h2>
+    <ol class="steps">
+      <li><b>prove</b> submit <code>Qed/Basic.lean</code> to Aristotle and wait for the verified file</li>
+      <li><b>check</b> <code>lake build</code> must pass with no errors, no <code>sorry</code>, standard axioms only — otherwise <span class="dim">"no proof, no launch."</span></li>
+      <li><b>stamp</b> send a 0-value self-transaction carrying the file's SHA-256 as calldata and wait for it to confirm</li>
+      <li><b>launch</b> obtain launchpad's signed authorization, verify the calldata locally, simulate, then broadcast</li>
+    </ol>
+  </section>
+
+  <footer>
+    sender 0xD9488E6d6f77485eF60C5Fdf0B05e494f7916D4F · <a href="https://github.com/QEDRH/qed" target="_blank" rel="noopener">source</a> · <a href="https://github.com/QEDRH/qed/blob/main/LAUNCH_RECORD.md" target="_blank" rel="noopener">launch record</a>
+  </footer>
+</main>
+
+<script>
+(function () {
+  const RPC = 'https://rpc.mainnet.chain.robinhood.com';
+  const ANCHOR_TX = '0xa524634ec0f99cf1b271bbd4dcdd6e17acefd6d83995a185351ed48c02bb51cf', LAUNCH_TX = '0xa0ba80fa706e06fa9c8eb0aaf78e5ace7a8c0b89cb36f71d384e582b42f29f97';
+  const recorded = document.getElementById('recorded-hash').textContent.trim();
+  const src = document.getElementById('proof-src').textContent;
+  document.getElementById('proof-view').textContent = src;
+
+  async function sha256Hex(str) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+    return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+  document.getElementById('recompute').addEventListener('click', async () => {
+    const out = document.getElementById('computed-hash'), st = document.getElementById('hash-status');
+    try {
+      const h = await sha256Hex(src);
+      out.textContent = h;
+      const same = h === recorded;
+      st.className = same ? 'ok' : 'bad';
+      st.textContent = same ? '✓ matches the recorded fingerprint (' + new TextEncoder().encode(src).length + ' bytes hashed)' : '✗ does not match';
+    } catch (e) { st.className = 'bad'; st.textContent = 'hashing failed: ' + e; }
+  });
+
+  async function rpc(method, params) {
+    const r = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
+    const j = await r.json(); if (j.error) throw new Error(j.error.message); return j.result;
+  }
+  (async () => {
+    const inp = document.getElementById('anchor-input'), st = document.getElementById('anchor-status');
+    try {
+      const tx = await rpc('eth_getTransactionByHash', [ANCHOR_TX]);
+      const input = (tx.input || '').replace(/^0x/, '');
+      inp.textContent = input;
+      const same = input === recorded && tx.from.toLowerCase() === tx.to.toLowerCase() && tx.value === '0x0';
+      st.className = same ? 'ok' : 'bad';
+      st.textContent = same ? '✓ on-chain input equals the fingerprint; 0 ETH self-transfer confirmed live from the RPC' : '✗ mismatch';
+    } catch (e) {
+      inp.innerHTML = '<span class="dim">live RPC read unavailable in this browser (' + String(e).slice(0, 60) + '). Open the tx on Blockscout and compare its input data to the fingerprint.</span>';
+    }
+    try {
+      const [a, l] = await Promise.all([rpc('eth_getTransactionReceipt', [ANCHOR_TX]), rpc('eth_getTransactionReceipt', [LAUNCH_TX])]);
+      const ab = parseInt(a.blockNumber, 16), lb = parseInt(l.blockNumber, 16);
+      document.getElementById('launch-block').textContent = lb.toLocaleString();
+      const ls = document.getElementById('launch-status');
+      const ok = lb > ab && a.status === '0x1' && l.status === '0x1';
+      ls.className = ok ? 'ok' : 'bad';
+      ls.textContent = ok ? '✓ live from the RPC: anchor in block ' + ab.toLocaleString() + ', launch in block ' + lb.toLocaleString() + ', both succeeded' : '✗ unexpected order or status';
+    } catch (e) { /* recorded values stay on screen */ }
+  })();
+})();
+</script>
+</body>
+</html>

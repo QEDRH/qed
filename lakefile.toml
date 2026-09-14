@@ -1,0 +1,11 @@
+name = "qed"
+version = "0.1.0"
+defaultTargets = ["Qed"]
+
+[[lean_lib]]
+name = "Qed"
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4.git"
+rev = "v4.28.0"
