@@ -72,7 +72,7 @@ EXPLORER_TX = "https://robinhoodchain.blockscout.com/tx/"
 
 # Pons V2 launchpad (ponsfamily.com). The site's create page is a Next.js app
 # that calls PonsV2LaunchFactory directly from the connected wallet via
-# wagmi/viem: there is no backend and no signed authorization (unlike launchpad).
+# wagmi/viem: there is no backend and no signed authorization (unlike launchpads that sign launches in a backend).
 # Addresses are hard-coded in the site's bundle (getPonsV2FactoryAddress) and
 # match https://github.com/ponsdotdev/ponsfamily (contractsV2/, verified source).
 PONS_FACTORY = "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e"          # PonsV2LaunchFactory
@@ -104,7 +104,7 @@ DESCRIPTION_MAX = 256                                          # and no links
 TOKEN_NAME = "test3"
 TOKEN_SYMBOL = "TEST3"
 TOKEN_DESCRIPTION = "test3: a deploy-by-proof test token. Launch gated on a machine-checked Lean proof."
-TOKEN_TWITTER = "example"  # X handle or URL; stored on-chain as https://x.com/<handle> like the site does
+TOKEN_TWITTER = ""  # optional X handle or URL; stored on-chain as https://x.com/<handle> like the site does
 TOKEN_IMAGE = ROOT / "logo.png"  # a placeholder is generated only if this file is missing
 IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
 

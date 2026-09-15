@@ -111,7 +111,7 @@ end Qed
       <div class="k">tx</div><div class="v"><a href="https://robinhoodchain.blockscout.com/tx/0xa0ba80fa706e06fa9c8eb0aaf78e5ace7a8c0b89cb36f71d384e582b42f29f97" target="_blank" rel="noopener">0xa0ba80fa706e06fa9c8eb0aaf78e5ace7a8c0b89cb36f71d384e582b42f29f97</a></div>
       <div class="k">block</div><div class="v"><span id="launch-block">63,007,700</span></div>
       <div class="k">order</div><div class="v" id="order">launch block 63,007,700 &gt; anchor block 63,007,508 <span class="ok badge">✓ stamped before launched</span></div>
-      <div class="k">token</div><div class="v"><a href="https://launchpad.example/tokens/0x666ed8c77f43ec1536308ce2bc1fa2e777431e18" target="_blank" rel="noopener">0x666ed8c77f43ec1536308ce2bc1fa2e777431e18</a> <span class="dim">test2 / TESTII, paired with SPCX</span></div>
+      <div class="k">token</div><div class="v"><a href="https://robinhoodchain.blockscout.com/token/0x666ed8c77f43ec1536308ce2bc1fa2e777431e18" target="_blank" rel="noopener">0x666ed8c77f43ec1536308ce2bc1fa2e777431e18</a> <span class="dim">test2 / TESTII, paired with SPCX</span></div>
       <div class="k">via</div><div class="v">launchpad factory <span class="dim">0x1Eef016F22A943abC7DD11422EDeE9D235942104</span></div>
     </div>
     <div id="launch-status" style="margin-top:8px" class="dim"></div>
@@ -135,7 +135,7 @@ end Qed
       <li><b>prove</b> submit <code>Qed/Basic.lean</code> to Aristotle and wait for the verified file</li>
       <li><b>check</b> <code>lake build</code> must pass with no errors, no <code>sorry</code>, standard axioms only — otherwise <span class="dim">"no proof, no launch."</span></li>
       <li><b>stamp</b> send a 0-value self-transaction carrying the file's SHA-256 as calldata and wait for it to confirm</li>
-      <li><b>launch</b> obtain launchpad's signed authorization, verify the calldata locally, simulate, then broadcast</li>
+      <li><b>launch</b> build the launch call, verify the calldata locally, simulate, then broadcast</li>
     </ol>
   </section>
 
