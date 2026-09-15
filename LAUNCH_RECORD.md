@@ -32,3 +32,18 @@ Deploy-by-proof launches gated on `Qed/Basic.lean` (theorem `Qed.le_initialValue
 | tokenURI | `ipfs://bafkreiaqfqfj7uk2vj5no4p43vvf6okshkeogkndzaeha6xmnn6nn53mmu` |
 | Launcher | `0x1Eef016F22A943abC7DD11422EDeE9D235942104` |
 | Explorer | https://robinhoodchain.blockscout.com/tx/a0ba80fa706e06fa9c8eb0aaf78e5ace7a8c0b89cb36f71d384e582b42f29f97 |
+
+## 2026-09-15 10:18 UTC — TEST3 via Pons V2 PonsV2LaunchFactory (paired with ETH)
+
+| Field | Value |
+|---|---|
+| Proof SHA-256 | `77f733e0ae4731d100ab2815af200f290fc66a266a707bf5c8e365b364baf2cf` |
+| Sender | `0xD9488E6d6f77485eF60C5Fdf0B05e494f7916D4F` |
+| Anchor tx | `5422db7d0b4696ea30cf610aecbc6da568202c3a5bbcb9a5718bf975834d6a73` |
+| Launch tx | `ddc439c34efa192680878a0cb3fdda0b15c86932ee4d39743af0c142227f359a` |
+| Token | `0x59A74F6da82043514Df221743a8C70D2d8565feB` — test3 / TEST3 |
+| Bonding curve | `0xaACf3604Efd568AcE145722f38dbfc8610383b7B` |
+| Logo | `ipfs://bafybeihwqbyausolhwzaerucno265k4qmwyss4zxq7oc2wg5bf4bkwfozy` (on-chain `logo()`), twitter https://x.com/example |
+| Launch fee | 0.0005 ETH, expectedEconomics `a9fc75d4203a33fe660e8fa32c74c3aa41c1fda4bf23d3a39b6bc22a1f8b1ca7`, salt `1445e339f32003783a9c635c30ac1bdf57634e3de7978bc9b3116910f5c75e93` |
+| Factory | `0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e` (launchConfigId 0, pairToken `0x0000000000000000000000000000000000000000`) |
+| Explorer | https://robinhoodchain.blockscout.com/tx/ddc439c34efa192680878a0cb3fdda0b15c86932ee4d39743af0c142227f359a |

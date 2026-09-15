@@ -3,19 +3,22 @@
 # dependencies = ["web3>=7,<9", "requests>=2.31"]
 # ///
 """
-deploy-by-proof: launch a token on launchpad (Robinhood Chain) ONLY after the
-Lean proof in qed/Qed/Basic.lean is verified.
+deploy-by-proof: launch a token on Pons V2 (ponsfamily.com, Robinhood Chain) ONLY
+after the Lean proof in qed/Qed/Basic.lean is verified.
 
 Pipeline
   1. aristotle submit ... --wait      (prove / re-verify the rules in Basic.lean)
   2. lake build in qed/               (must succeed with no errors, no sorry)
   3. 0-value self-tx with the proof's SHA-256 as calldata (anchor), wait for it
-  4. launchpad launch, the way launchpad.example does it:
-       a. sign in with the wallet via Privy (SIWE)         -> bearer token
-       b. POST /ipfs/upload-image, POST /ipfs/upload-metadata -> tokenURI
-       c. POST /robinhood/prepare-launch                   -> signed calldata for
-          LaunchFactory.launch(CreateParams, LaunchAuthorization, signature)
-       d. verify the returned calldata locally, simulate it, then broadcast
+  4. Pons V2 launch, the way www.ponsfamily.com/launchpad/create does it:
+       a. POST the logo (multipart field "image") to the site's IPFS worker
+          -> {"uri": "ipfs://<cid>"}; the URI is stored on-chain in the token
+       b. read launchFee / canLaunch / getLaunchConfig(0) /
+          previewLaunchEconomics(0, ETH) from PonsV2LaunchFactory
+       c. build PonsV2LaunchFactory.launchToken(TokenParams, 0, address(0), [])
+          locally (no backend, no signed authorization; the site calls the
+          factory straight from the wallet), value = launchFee
+       d. simulate it (eth_call), then broadcast
   5. print anchor tx hash, launch tx hash + SHA-256 of the proof file
 
 If the proof check fails at any point the script prints "no proof, no launch."
@@ -30,8 +33,6 @@ Environment
   PRIVATE_KEY        required; the launching wallet's key, 0x-prefixed 32-byte hex.
                      This public copy reads it from the process environment only
                      and never writes or logs it. Use a dedicated burner wallet.
-  LONG_ACCESS_TOKEN  optional; a Privy access token for launchpad.example. If set, the
-                     SIWE sign-in step is skipped and this token is used instead.
 """
 
 from __future__ import annotations
@@ -39,7 +40,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
-import json
 import os
 import re
 import secrets
@@ -49,13 +49,11 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import uuid
 import zlib
 from pathlib import Path
 
 import requests
-from eth_abi import decode as abi_decode, encode as abi_encode
-from eth_account.messages import encode_defunct
+from eth_abi import decode as abi_decode
 from web3 import Web3
 
 # --------------------------------------------------------------------------- #
@@ -72,85 +70,94 @@ CHAIN_ID = 4663
 RPC_URL = os.environ.get("ROBINHOOD_RPC_URL", "https://rpc.mainnet.chain.robinhood.com")
 EXPLORER_TX = "https://robinhoodchain.blockscout.com/tx/"
 
-# launchpad launch factory (UUPS proxy; impl LaunchFactory, verified on Sourcify).
-# Source of truth: https://sourcify.dev/server/v2/contract/4663/0x7B7b87fd1Fb05864cD572C7306038552286c73d9
-LONG_LAUNCHER = "0x1Eef016F22A943abC7DD11422EDeE9D235942104"
-AIRLOCK = "0xeb7c034704ef8dcd2d32324c1545f62fb4ad0862"
-# Floor enforced on-chain by LaunchFactory._enforceFloor (read live on 2026-09-14):
-TRUSTED_TOKEN_FACTORY = "0x1B37D3a72082029c44B35B604Ea473617580b69a"    # DopplerERC20V1Factory
-REQUIRED_POOL_INITIALIZER = "0x4e3468951D49f2EEa976eD0D6e75fFCb44a9a544"  # DopplerHookInitializer
-REQUIRED_INTEGRATOR = "0x92d435C96E63c43E12d6D0AB28f6b0B04072F765"
+# Pons V2 launchpad (ponsfamily.com). The site's create page is a Next.js app
+# that calls PonsV2LaunchFactory directly from the connected wallet via
+# wagmi/viem: there is no backend and no signed authorization (unlike launchpad).
+# Addresses are hard-coded in the site's bundle (getPonsV2FactoryAddress) and
+# match https://github.com/ponsdotdev/ponsfamily (contractsV2/, verified source).
+PONS_FACTORY = "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e"          # PonsV2LaunchFactory
+PONS_LAUNCH_DEPLOYER = "0x3711ceA4feaDE896C913C68F01Eda97Cb06D1A42"  # PonsV2LaunchDeployer (factory.launchDeployer())
+PONS_MEME_HOOK = "0xE5e702641Ea86F4ae6cC3cDaeD2B886f976Be044"        # PonsV2MemeHook (factory.memeHook())
+PONS_LAUNCH_AND_BUY_ROUTER = "0xe33E9E479dF8802cb0866d5d05258bEc4cF62948"  # site uses it only for a dev buy; unused here
+PONS_LAUNCH_CONFIG_ID = 0   # the site always passes 0: 1e9 supply, 1% curve fee, 4.2 ETH graduation
+PAIR_TOKEN = "0x0000000000000000000000000000000000000000"  # address(0) = native ETH quote (site default)
+CREATOR_TAX_BPS = 0         # site default (extra creator tax slider at 0); capped on-chain by maxCreatorTaxBps
+BUYBACK_ENABLED = False     # the site always sends false
+SNIPE_TAX_EXEMPTIONS: list[str] = []  # extra wallets; the sender is exempted on-chain automatically
 
-# launchpad web-app backend, as wired in launchpad.example's bundle. The API key is the
-# public one embedded in the frontend; the bearer token comes from Privy sign-in.
-LONG_API_URL = "https://api.launchpad.example/v1"
-LONG_API_KEY = "lxyz_49534dc2febae30294149790a8152f44bf915ebbe0332213"
-LONG_APP_ORIGIN = "https://launchpad.example"
-PRIVY_APP_ID = "cmppfotax00ql0clcbz4vvt4b"
-PRIVY_API = "https://auth.privy.io/api/v1"
+# Logo upload, as the site does it: multipart POST with field "image" to this
+# Cloudflare worker; it answers {"uri": "ipfs://<cid>"}. PNG/JPEG/WebP/GIF, < 5 MB.
+PONS_IPFS_UPLOAD_URL = "https://pons-vercel-data-gateway.ozzy-6de.workers.dev/public/ipfs/image"
+PONS_APP_ORIGIN = "https://www.ponsfamily.com"
+PONS_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+PONS_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+IPFS_URI_RE = re.compile(r"^ipfs://[a-zA-Z0-9]+$")            # site: isValidIpfsUri
 
-# Numeraire: SPCX (SpaceX Robinhood stock token), 18 decimals, BeaconProxy.
-NUMERAIRE = "0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa"
+# Site-side form rules (ponsfamily.com bundle, module 422799). The contract's own
+# caps are looser (name 64, symbol 16, logo 512, description 2048 bytes).
+NAME_RE = re.compile(r"^[A-Za-z0-9]+(?: [A-Za-z0-9]+)*$")      # <= 32 chars
+SYMBOL_RE = re.compile(r"^[A-Z0-9]+$")                         # <= 10 chars
+X_HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+DESCRIPTION_MAX = 256                                          # and no links
 
 # Token to launch
-TOKEN_NAME = "test2"
-TOKEN_SYMBOL = "TESTII"  # launchpad tickers are A-Z only (1-15 chars); "TEST2" is rejected on-chain
-TOKEN_DESCRIPTION = "test2: a deploy-by-proof test token. Launch gated on a machine-checked Lean proof."
-TOKEN_SOCIALS: list[tuple[str, str]] = [("Twitter", "https://x.com/example")]  # (label, url)
+TOKEN_NAME = "test3"
+TOKEN_SYMBOL = "TEST3"
+TOKEN_DESCRIPTION = "test3: a deploy-by-proof test token. Launch gated on a machine-checked Lean proof."
+TOKEN_TWITTER = "example"  # X handle or URL; stored on-chain as https://x.com/<handle> like the site does
 TOKEN_IMAGE = ROOT / "logo.png"  # a placeholder is generated only if this file is missing
 IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
 
-LAUNCHER_ABI = [
-    {"type": "function", "name": "launch", "stateMutability": "nonpayable",
-     "inputs": [
-         {"name": "data", "type": "tuple", "components": [
-             {"name": "initialSupply", "type": "uint256"},
-             {"name": "numTokensToSell", "type": "uint256"},
-             {"name": "numeraire", "type": "address"},
-             {"name": "tokenFactory", "type": "address"},
-             {"name": "tokenFactoryData", "type": "bytes"},
-             {"name": "governanceFactory", "type": "address"},
-             {"name": "governanceFactoryData", "type": "bytes"},
-             {"name": "poolInitializer", "type": "address"},
-             {"name": "poolInitializerData", "type": "bytes"},
-             {"name": "liquidityMigrator", "type": "address"},
-             {"name": "liquidityMigratorData", "type": "bytes"},
-             {"name": "integrator", "type": "address"},
-             {"name": "salt", "type": "bytes32"}]},
-         {"name": "auth", "type": "tuple", "components": [
-             {"name": "launcher", "type": "address"},
-             {"name": "paramsHash", "type": "bytes32"},
-             {"name": "expectedAsset", "type": "address"},
-             {"name": "deadline", "type": "uint256"}]},
-         {"name": "signature", "type": "bytes"}],
-     "outputs": [
-         {"name": "asset", "type": "address"}, {"name": "pool", "type": "address"},
-         {"name": "governance", "type": "address"}, {"name": "timelock", "type": "address"},
-         {"name": "migrationPool", "type": "address"}]},
-    {"type": "function", "name": "isTickerAvailable", "stateMutability": "view",
-     "inputs": [{"name": "ticker", "type": "string"}], "outputs": [{"type": "bool"}]},
-    {"type": "function", "name": "getTickerRecord", "stateMutability": "view",
-     "inputs": [{"name": "ticker", "type": "string"}],
-     "outputs": [{"type": "tuple", "components": [
-         {"name": "token", "type": "address"}, {"name": "deployedAt", "type": "uint48"},
-         {"name": "reservedUntil", "type": "uint48"}]}]},
-    {"type": "function", "name": "isSigner", "stateMutability": "view",
-     "inputs": [{"type": "address"}], "outputs": [{"type": "bool"}]},
-    {"type": "function", "name": "hashLaunchAuthorization", "stateMutability": "view",
-     "inputs": [{"name": "auth", "type": "tuple", "components": [
-         {"name": "launcher", "type": "address"}, {"name": "paramsHash", "type": "bytes32"},
-         {"name": "expectedAsset", "type": "address"}, {"name": "deadline", "type": "uint256"}]}],
+_SOCIALS = [{"name": n, "type": "string"} for n in ("twitter", "telegram", "discord", "website", "farcaster")]
+TOKEN_PARAMS_COMPONENTS = [
+    {"name": "name", "type": "string"}, {"name": "symbol", "type": "string"},
+    {"name": "logo", "type": "string"}, {"name": "description", "type": "string"},
+    {"name": "socials", "type": "tuple", "components": _SOCIALS},
+    {"name": "creatorFeeRecipient", "type": "address"}, {"name": "creatorTaxBps", "type": "uint16"},
+    {"name": "buybackEnabled", "type": "bool"}, {"name": "expectedEconomics", "type": "bytes32"},
+    {"name": "salt", "type": "bytes32"},
+]
+LAUNCH_CONFIG_COMPONENTS = [
+    {"name": "supply", "type": "uint256"}, {"name": "curveFeeBps", "type": "uint256"},
+    {"name": "phantomQuote", "type": "uint256"}, {"name": "graduationThreshold", "type": "uint256"},
+    {"name": "poolFee", "type": "uint24"}, {"name": "tickSpacing", "type": "int24"}, {"name": "enabled", "type": "bool"},
+]
+# Only the 4-arg launchToken overload is listed (the one the site encodes), so
+# web3 never has to disambiguate overloads.
+PONS_FACTORY_ABI = [
+    {"type": "function", "name": "launchToken", "stateMutability": "payable",
+     "inputs": [{"name": "params", "type": "tuple", "components": TOKEN_PARAMS_COMPONENTS},
+                {"name": "launchConfigId", "type": "uint256"}, {"name": "pairToken", "type": "address"},
+                {"name": "snipeTaxExemptions", "type": "address[]"}],
+     "outputs": [{"name": "token", "type": "address"}, {"name": "curve", "type": "address"}]},
+    {"type": "function", "name": "previewLaunchEconomics", "stateMutability": "view",
+     "inputs": [{"name": "launchConfigId", "type": "uint256"}, {"name": "pairToken", "type": "address"}],
      "outputs": [{"type": "bytes32"}]},
-    {"type": "function", "name": "paused", "stateMutability": "view", "inputs": [], "outputs": [{"type": "bool"}]},
+    {"type": "function", "name": "getLaunchConfig", "stateMutability": "view",
+     "inputs": [{"name": "id", "type": "uint256"}],
+     "outputs": [{"type": "tuple", "components": LAUNCH_CONFIG_COMPONENTS}]},
+    {"type": "function", "name": "canLaunch", "stateMutability": "view",
+     "inputs": [{"name": "launcher", "type": "address"}], "outputs": [{"type": "bool"}]},
+    {"type": "function", "name": "launchEnabled", "stateMutability": "view", "inputs": [], "outputs": [{"type": "bool"}]},
+    {"type": "function", "name": "launchFee", "stateMutability": "view", "inputs": [], "outputs": [{"type": "uint256"}]},
+    {"type": "function", "name": "maxCreatorTaxBps", "stateMutability": "view", "inputs": [], "outputs": [{"type": "uint256"}]},
+    {"type": "function", "name": "approvedPairTokens", "stateMutability": "view",
+     "inputs": [{"name": "pairToken", "type": "address"}], "outputs": [{"type": "bool"}]},
+    {"type": "function", "name": "launchDeployer", "stateMutability": "view", "inputs": [], "outputs": [{"type": "address"}]},
+    {"type": "function", "name": "memeHook", "stateMutability": "view", "inputs": [], "outputs": [{"type": "address"}]},
+    {"type": "event", "name": "TokenLaunched", "anonymous": False,
+     "inputs": [{"name": "token", "type": "address", "indexed": True}, {"name": "curve", "type": "address", "indexed": True},
+                {"name": "deployer", "type": "address", "indexed": True}, {"name": "pairToken", "type": "address", "indexed": False},
+                {"name": "launchConfigId", "type": "uint256", "indexed": False},
+                {"name": "graduationThreshold", "type": "uint256", "indexed": False}]},
 ]
-CREATE_PARAMS_TYPE = "(uint256,uint256,address,address,bytes,address,bytes,address,bytes,address,bytes,address,bytes32)"
-TOKEN_FACTORY_DATA_TYPES = ["string", "string", "(uint64,uint64)[]", "address[]", "uint256[]", "uint256[]",
-                            "string", "uint256", "uint48", "address", "address[]"]
-
-ERC20_ABI = [
-    {"type": "function", "name": "symbol", "stateMutability": "view", "inputs": [], "outputs": [{"type": "string"}]},
-    {"type": "function", "name": "decimals", "stateMutability": "view", "inputs": [], "outputs": [{"type": "uint8"}]},
-]
+# Custom errors PonsV2LaunchFactory / PonsV2LaunchDeployer can revert with, for readable failures.
+PONS_ERRORS = {Web3.keccak(text=sig)[:4].hex().removeprefix("0x"): sig for sig in (
+    "LaunchFeeNotPaid()", "NotWhitelisted()", "InvalidTokenParams()", "MetadataTooLong()", "CreatorTaxTooHigh()",
+    "LaunchConfigDisabled()", "InvalidLaunchConfigId()", "PairTokenNotApproved()", "CombinedFeeTooHigh()",
+    "LaunchEconomicsMismatch(bytes32,bytes32)", "LaunchDeployerNotSet()", "LaunchDependenciesNotWired()",
+    "ExemptionListTooLong()", "GraduationSeedNotViable()", "FeeTransferFailed()", "ReentrancyGuardReentrantCall()",
+)}
 
 # Aristotle prompt: re-verify the rules already stated in Basic.lean
 ARISTOTLE_PROMPT = (
@@ -196,12 +203,6 @@ def check_config() -> None:
     ]
     if missing:
         sys.exit(f"deploy.py config not filled in: {', '.join(missing)}")
-
-
-
-
-def load_env_value(key: str) -> str | None:
-    return os.environ.get(key, "").strip() or None
 
 
 # --------------------------------------------------------------------------- #
@@ -352,123 +353,8 @@ def anchor_proof(w3, acct, digest: str, dry_run: bool) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# Step 4: launchpad launch (mirrors launchpad.example)                               #
+# Step 4: Pons V2 launch (mirrors www.ponsfamily.com/launchpad/create)         #
 # --------------------------------------------------------------------------- #
-
-
-class LongClient:
-    """Thin client for the endpoints launchpad.example calls when launching."""
-
-    def __init__(self, acct):
-        self.acct = acct
-        self.http = requests.Session()
-        self.http.headers.update({"Origin": LONG_APP_ORIGIN, "Referer": LONG_APP_ORIGIN + "/create",
-                                  "User-Agent": "deploy-by-proof/1.0"})
-        self.token: str | None = None
-
-    # -- auth ---------------------------------------------------------------
-    def sign_in(self) -> str:
-        """Privy sign-in with Ethereum (EIP-4361), as the site's Privy SDK does."""
-        preset = load_env_value("LONG_ACCESS_TOKEN")
-        if preset:
-            log("launchpad: using LONG_ACCESS_TOKEN from .env")
-            self.token = preset
-            return preset
-        addr = self.acct.address
-        headers = {"privy-app-id": PRIVY_APP_ID, "privy-ca-id": str(uuid.uuid4()),
-                   "Content-Type": "application/json"}
-        r = self.http.post(f"{PRIVY_API}/siwe/init", json={"address": addr}, headers=headers, timeout=30)
-        if r.status_code != 200:
-            sys.exit(f"privy siwe/init failed {r.status_code}: {r.text[:300]}")
-        nonce = r.json()["nonce"]
-        issued = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        host = LONG_APP_ORIGIN.split("://", 1)[1]
-        message = (
-            f"{host} wants you to sign in with your Ethereum account:\n{addr}\n\n"
-            "By signing, you are proving you own this wallet and logging in. "
-            "This does not initiate a transaction or cost any fees.\n\n"
-            f"URI: {LONG_APP_ORIGIN}\nVersion: 1\nChain ID: {CHAIN_ID}\nNonce: {nonce}\n"
-            f"Issued At: {issued}\nResources:\n- https://privy.io"
-        )
-        sig = self.acct.sign_message(encode_defunct(text=message)).signature.hex()
-        if not sig.startswith("0x"):
-            sig = "0x" + sig
-        body = {"message": message, "signature": sig, "chainId": f"eip155:{CHAIN_ID}",
-                "walletClientType": "unknown", "connectorType": "injected", "mode": "login-or-sign-up"}
-        r = self.http.post(f"{PRIVY_API}/siwe/authenticate", json=body, headers=headers, timeout=30)
-        if r.status_code != 200:
-            sys.exit(f"privy siwe/authenticate failed {r.status_code}: {r.text[:300]}")
-        data = r.json()
-        token = data.get("token") or data.get("privy_access_token") or data.get("access_token")
-        if not token:
-            sys.exit(f"privy authenticate returned no token; keys: {sorted(data)}")
-        self.token = token
-        log(f"launchpad: signed in as {addr} via Privy")
-        return token
-
-    def _api_headers(self, bearer: bool) -> dict:
-        h = {"x-api-key": LONG_API_KEY}
-        if bearer:
-            h["Authorization"] = f"Bearer {self.token}"
-        return h
-
-    # -- metadata -----------------------------------------------------------
-    def upload_image(self, path: Path) -> str:
-        with path.open("rb") as f:
-            r = self.http.post(f"{LONG_API_URL}/ipfs/upload-image", headers=self._api_headers(False),
-                               files={"image": (path.name, f, IMAGE_MIME.get(path.suffix.lower(), "application/octet-stream"))},
-                               timeout=120)
-        if not r.ok:
-            sys.exit(f"launchpad upload-image failed {r.status_code}: {r.text[:300]}")
-        cid = r.json()["result"]
-        log(f"launchpad: image uploaded -> {cid}")
-        return cid
-
-    def upload_metadata(self, image_cid: str) -> str:
-        body = {
-            "name": TOKEN_NAME.strip(),
-            "description": TOKEN_DESCRIPTION.strip(),
-            "fee_receiver": self.acct.address,
-            "image_hash": f"ipfs://{image_cid}",
-            "social_links": [{"label": label, "url": url} for label, url in TOKEN_SOCIALS if url],
-            "vesting_recipients": [{"address": "0x0000000000000000000000000000000000000000", "amount": 0}],
-            "categories": [],
-        }
-        r = self.http.post(f"{LONG_API_URL}/ipfs/upload-metadata", json=body,
-                           headers=self._api_headers(False), timeout=60)
-        if not r.ok:
-            sys.exit(f"launchpad upload-metadata failed {r.status_code}: {r.text[:300]}")
-        meta = r.json()["result"]
-        token_uri = meta if str(meta).startswith("ipfs://") else f"ipfs://{meta}"
-        log(f"launchpad: metadata uploaded -> {token_uri}")
-        return token_uri  # launchpad.example sends metadata_hash as `ipfs://<cid>` to prepare-launch
-
-    # -- authorization ------------------------------------------------------
-    def prepare_launch(self, token_uri: str) -> dict:
-        body = {
-            "launcher": self.acct.address,
-            "name": TOKEN_NAME.strip(),
-            "ticker": TOKEN_SYMBOL.strip().upper(),
-            "numeraire": Web3.to_checksum_address(NUMERAIRE),
-            "tokenURI": token_uri,
-            "feeReceiver": self.acct.address,
-        }
-        r = self.http.post(f"{LONG_API_URL}/robinhood/prepare-launch", json=body,
-                           headers=self._api_headers(True), timeout=120)
-        try:
-            data = r.json()
-        except ValueError:
-            data = None
-        if not r.ok or not isinstance(data, dict):  # the API answers 201 Created on success
-            msg = (data or {}).get("message") if isinstance(data, dict) else None
-            sys.exit(f"launchpad prepare-launch failed {r.status_code}: {msg or r.text[:300]}")
-        for k in ("to", "data", "expectedAsset", "deadline"):
-            if k not in data:
-                sys.exit(f"prepare-launch response missing {k}: {sorted(data)}")
-        if str(data.get("value", "0")) not in ("0", "0x0"):
-            sys.exit("prepare-launch asked for a non-zero value; refusing")
-        log(f"launchpad: prepare-launch ok; expectedAsset {data['expectedAsset']}, deadline {data['deadline']}")
-        return data
 
 
 def placeholder_png(path: Path, size: int = 256, rgb: tuple = (20, 20, 24)) -> None:
@@ -487,133 +373,166 @@ def placeholder_png(path: Path, size: int = 256, rgb: tuple = (20, 20, 24)) -> N
     path.write_bytes(png)
 
 
-def verify_prepared_calldata(w3, acct, launcher, prepared: dict) -> dict:
-    """Decode the calldata launchpad returned and check it is exactly a launch of OUR token."""
-    to = Web3.to_checksum_address(prepared["to"])
-    if to != Web3.to_checksum_address(LONG_LAUNCHER):
-        sys.exit(f"prepare-launch targets {to}, expected LaunchFactory {LONG_LAUNCHER}")
-    data = bytes.fromhex(prepared["data"][2:] if prepared["data"].startswith("0x") else prepared["data"])
+def x_profile_url(handle_or_url: str) -> str:
+    """normalizeXHandle + toXProfileUrl from the site: '@foo', 'x.com/foo', 'https://twitter.com/foo' -> https://x.com/foo."""
+    h = handle_or_url.strip().lstrip("@")
+    if not h:
+        return ""
+    if re.match(r"^(https?://)?(www\.)?(x|twitter)\.com/", h, re.I):
+        h = re.sub(r"^(https?://)?(www\.)?(x|twitter)\.com/+", "", h, flags=re.I).split("/")[0].split("?")[0]
+    if not X_HANDLE_RE.fullmatch(h):
+        sys.exit(f"TOKEN_TWITTER {handle_or_url!r} is not a valid X handle (1-15 of A-Za-z0-9_)")
+    return f"https://x.com/{h}"
+
+
+def validate_token_identity() -> tuple[str, str, str]:
+    """The checks the site's form applies before it lets you submit."""
+    name, symbol, desc = TOKEN_NAME.strip(), TOKEN_SYMBOL.strip().upper(), TOKEN_DESCRIPTION.strip()
+    if not (0 < len(name) <= 32 and NAME_RE.fullmatch(name)):
+        sys.exit("Token names must use letters, numbers, and spaces with at most 32 characters.")
+    if not (0 < len(symbol) <= 10 and SYMBOL_RE.fullmatch(symbol)):
+        sys.exit("Token symbols must use letters and numbers with at most 10 characters.")
+    if len(desc) > DESCRIPTION_MAX:
+        sys.exit(f"Descriptions must be {DESCRIPTION_MAX} characters or fewer.")
+    if re.search(r"https?://|www\s*\.|\b[a-z0-9-]+\.(com|io|xyz|net|org|fun|family|app|co)\b", desc, re.I):
+        sys.exit("Links are not allowed in token descriptions.")
+    return name, symbol, desc
+
+
+def upload_logo(path: Path) -> str:
+    """POST the logo to the site's IPFS worker exactly as the create page does; returns ipfs://<cid>."""
+    mime = IMAGE_MIME.get(path.suffix.lower())
+    if mime not in PONS_IMAGE_MIMES:
+        sys.exit(f"{path.name}: use a PNG, JPEG, WebP, or GIF image")
+    size = path.stat().st_size
+    if size == 0 or size > PONS_IMAGE_MAX_BYTES:
+        sys.exit(f"{path.name}: images must be smaller than 5 MB (got {size} bytes)")
+    headers = {"Origin": PONS_APP_ORIGIN, "Referer": PONS_APP_ORIGIN + "/launchpad/create",
+               "User-Agent": "deploy-by-proof/1.0", "Accept": "application/json"}
+    with path.open("rb") as f:
+        r = requests.post(PONS_IPFS_UPLOAD_URL, headers=headers, files={"image": (path.name, f, mime)}, timeout=120)
     try:
-        fn, args = launcher.decode_function_input(data)
-    except Exception as e:  # noqa: BLE001
-        sys.exit(f"prepared calldata does not decode as LaunchFactory.launch: {e}")
-    if fn.fn_name != "launch":
-        sys.exit(f"prepared calldata calls {fn.fn_name}, not launch")
-    cp, auth, sig = args["data"], args["auth"], args["signature"]
+        data = r.json()
+    except ValueError:
+        data = {}
+    uri = data.get("uri") if isinstance(data, dict) else None
+    if not r.ok or not uri or not IPFS_URI_RE.fullmatch(uri):
+        sys.exit(f"pons IPFS upload failed {r.status_code}: {(data or {}).get('error') or r.text[:300]}")
+    log(f"pons: logo uploaded -> {uri} ({size} bytes)")
+    return uri
 
-    # LaunchAuthorization must be for us, for this asset, and match the params hash.
-    if Web3.to_checksum_address(auth["launcher"]) != acct.address:
-        sys.exit(f"authorization is for launcher {auth['launcher']}, not {acct.address}")
-    expected_asset = Web3.to_checksum_address(prepared["expectedAsset"])
-    if Web3.to_checksum_address(auth["expectedAsset"]) != expected_asset:
-        sys.exit("authorization expectedAsset != response expectedAsset")
-    cp_tuple = tuple(cp[k] for k in ("initialSupply", "numTokensToSell", "numeraire", "tokenFactory",
-                                     "tokenFactoryData", "governanceFactory", "governanceFactoryData",
-                                     "poolInitializer", "poolInitializerData", "liquidityMigrator",
-                                     "liquidityMigratorData", "integrator", "salt"))
-    params_hash = Web3.keccak(abi_encode([CREATE_PARAMS_TYPE], [cp_tuple]))
-    if bytes(auth["paramsHash"]) != params_hash:
-        sys.exit("authorization paramsHash does not match the CreateParams in the calldata")
-    now = int(dt.datetime.now(dt.timezone.utc).timestamp())
-    if not (now < int(auth["deadline"]) <= now + 3600):
-        sys.exit(f"authorization deadline {auth['deadline']} is outside (now, now+1h]")
 
-    # The launch must be for our token, paired with SPCX, through the on-chain floor.
-    name, symbol, *_rest = abi_decode(TOKEN_FACTORY_DATA_TYPES, cp["tokenFactoryData"])
-    token_uri = _rest[4]
-    if name != TOKEN_NAME.strip() or symbol.upper() != TOKEN_SYMBOL.strip().upper():
-        sys.exit(f"calldata launches {name}/{symbol}, expected {TOKEN_NAME}/{TOKEN_SYMBOL}")
-    checks = {
-        "numeraire": (cp["numeraire"], NUMERAIRE),
-        "tokenFactory": (cp["tokenFactory"], TRUSTED_TOKEN_FACTORY),
-        "poolInitializer": (cp["poolInitializer"], REQUIRED_POOL_INITIALIZER),
-        "integrator": (cp["integrator"], REQUIRED_INTEGRATOR),
-    }
-    for k, (got, want) in checks.items():
-        if Web3.to_checksum_address(got) != Web3.to_checksum_address(want):
-            sys.exit(f"calldata {k} = {got}, expected {want}")
-    if cp["numTokensToSell"] > cp["initialSupply"]:
-        sys.exit("numTokensToSell > initialSupply")
-
-    # Signature must recover to a signer the factory trusts.
-    digest = launcher.functions.hashLaunchAuthorization(
-        (auth["launcher"], auth["paramsHash"], auth["expectedAsset"], auth["deadline"])).call()
-    signer = w3.eth.account._recover_hash(digest, signature=sig)
-    if not launcher.functions.isSigner(signer).call():
-        sys.exit(f"authorization signed by {signer}, which LaunchFactory does not trust")
-
-    log(f"calldata verified: {name}/{symbol} vs numeraire {cp['numeraire']}, supply {cp['initialSupply'] // 10**18:,}, "
-        f"sell {cp['numTokensToSell'] // 10**18:,}, tokenURI {token_uri}, signer {signer}")
-    return {"to": to, "data": data, "expectedAsset": expected_asset, "symbol": symbol,
-            "tokenURI": token_uri, "deadline": int(auth["deadline"])}
+def decode_revert(err: Exception) -> str:
+    msg = str(err)
+    m = re.search(r"0x([0-9a-fA-F]{8})", msg)
+    if m and m.group(1).lower() in PONS_ERRORS:
+        return f"{PONS_ERRORS[m.group(1).lower()]} ({msg[:200]})"
+    return msg[:400]
 
 
 def launch(w3, acct, dry_run: bool) -> dict:
-    launcher = w3.eth.contract(address=Web3.to_checksum_address(LONG_LAUNCHER), abi=LAUNCHER_ABI)
-    if launcher.functions.paused().call():
-        sys.exit("LaunchFactory is paused")
-    numeraire = w3.eth.contract(address=Web3.to_checksum_address(NUMERAIRE), abi=ERC20_ABI)
-    log(f"numeraire {NUMERAIRE}: symbol={numeraire.functions.symbol().call()} "
-        f"decimals={numeraire.functions.decimals().call()}")
-    ticker = TOKEN_SYMBOL.strip().upper()
-    try:
-        available = launcher.functions.isTickerAvailable(ticker).call()
-    except Exception as e:  # noqa: BLE001
-        err = str(e)
-        if "0xe666e3c7" in err:  # InvalidTickerCharacter(uint256 index, bytes1 character)
-            raw = err.split("0xe666e3c7", 1)[1][:128]
-            idx, ch = int(raw[:64], 16), bytes.fromhex(raw[64:66]).decode(errors="replace")
-            sys.exit(f"LaunchFactory rejects ticker {ticker!r}: invalid character {ch!r} at index {idx} "
-                     f"(launchpad tickers must be letters only)")
-        if "0x4f9730f8" in err:  # InvalidTickerLength(uint256)
-            sys.exit(f"LaunchFactory rejects ticker {ticker!r}: length must be 1-15 characters")
-        raise
-    if not available:
-        rec = launcher.functions.getTickerRecord(ticker).call()
-        sys.exit(f"ticker {ticker} is reserved by {rec[0]} until {dt.datetime.fromtimestamp(rec[2], dt.timezone.utc)}")
-    log(f"ticker {ticker} is available on LaunchFactory")
+    factory = w3.eth.contract(address=Web3.to_checksum_address(PONS_FACTORY), abi=PONS_FACTORY_ABI)
+    pair = Web3.to_checksum_address(PAIR_TOKEN)
+    if len(w3.eth.get_code(factory.address)) == 0:
+        sys.exit(f"no code at PonsV2LaunchFactory {PONS_FACTORY}")
 
-    client = LongClient(acct)
-    client.sign_in()
+    # -- preflight reads: the same multicall the create page issues -----------
+    fee = factory.functions.launchFee().call()
+    enabled = factory.functions.launchEnabled().call()
+    can_launch = factory.functions.canLaunch(acct.address).call()
+    max_tax = factory.functions.maxCreatorTaxBps().call()
+    deployer = factory.functions.launchDeployer().call()
+    hook = factory.functions.memeHook().call()
+    cfg = factory.functions.getLaunchConfig(PONS_LAUNCH_CONFIG_ID).call()
+    supply, curve_fee_bps, phantom_quote, grad_threshold, pool_fee, tick_spacing, cfg_enabled = cfg
+    if not can_launch:
+        sys.exit(f"PonsV2LaunchFactory.canLaunch({acct.address}) is false (launchEnabled={enabled}); refusing")
+    if not cfg_enabled:
+        sys.exit(f"launch config {PONS_LAUNCH_CONFIG_ID} is disabled")
+    if Web3.to_checksum_address(deployer) != Web3.to_checksum_address(PONS_LAUNCH_DEPLOYER):
+        sys.exit(f"factory.launchDeployer() = {deployer}, expected {PONS_LAUNCH_DEPLOYER}")
+    if Web3.to_checksum_address(hook) != Web3.to_checksum_address(PONS_MEME_HOOK):
+        sys.exit(f"factory.memeHook() = {hook}, expected {PONS_MEME_HOOK}")
+    if int(pair, 16) != 0 and not factory.functions.approvedPairTokens(pair).call():
+        sys.exit(f"pair token {pair} is not approved by the factory")
+    if CREATOR_TAX_BPS > max_tax:
+        sys.exit(f"CREATOR_TAX_BPS {CREATOR_TAX_BPS} > maxCreatorTaxBps {max_tax}")
+    economics = factory.functions.previewLaunchEconomics(PONS_LAUNCH_CONFIG_ID, pair).call()
+    log(f"pons: launchFee {w3.from_wei(fee, 'ether')} ETH, pair {'ETH (native)' if int(pair, 16) == 0 else pair}, "
+        f"config {PONS_LAUNCH_CONFIG_ID}: supply {supply // 10**18:,}, curve fee {curve_fee_bps} bps, "
+        f"phantom quote {w3.from_wei(phantom_quote, 'ether')} ETH, graduation {w3.from_wei(grad_threshold, 'ether')} ETH, "
+        f"tick spacing {tick_spacing}")
+    log(f"pons: expectedEconomics {economics.hex()}")
+
+    # -- metadata: on-chain strings, logo via the site's IPFS worker ----------
+    name, symbol, desc = validate_token_identity()
     if not TOKEN_IMAGE.exists():
         placeholder_png(TOKEN_IMAGE)
         log(f"generated placeholder image {TOKEN_IMAGE.name}")
-    image_cid = client.upload_image(TOKEN_IMAGE)
-    token_uri = client.upload_metadata(image_cid)
-    prepared = client.prepare_launch(token_uri)
-    v = verify_prepared_calldata(w3, acct, launcher, prepared)
+    logo_uri = upload_logo(TOKEN_IMAGE)
+    socials = (x_profile_url(TOKEN_TWITTER), "", "", "", "")  # site form: twitter, telegram; discord/website/farcaster empty
+    salt = secrets.token_bytes(32)  # site: crypto.getRandomValues(32 bytes)
+    params = (name, symbol, logo_uri, desc, socials, acct.address, CREATOR_TAX_BPS, BUYBACK_ENABLED, bytes(economics), salt)
+    exemptions = [Web3.to_checksum_address(a) for a in SNIPE_TAX_EXEMPTIONS]
+    data = factory.encode_abi("launchToken", args=[params, PONS_LAUNCH_CONFIG_ID, pair, exemptions])
+    data = bytes.fromhex(data[2:] if data.startswith("0x") else data)  # web3 v7 returns a hex string
 
-    tx = {"from": acct.address, "to": v["to"], "data": v["data"], "value": 0, "chainId": w3.eth.chain_id}
+    # -- self-check: decode what we are about to send -------------------------
+    fn, args = factory.decode_function_input(data)
+    p = args["params"]
+    if fn.fn_name != "launch" + "Token" or p["name"] != name or p["symbol"] != symbol or p["logo"] != logo_uri \
+            or p["socials"]["twitter"] != socials[0] or Web3.to_checksum_address(p["creatorFeeRecipient"]) != acct.address \
+            or bytes(p["expectedEconomics"]) != bytes(economics) or bytes(p["salt"]) != salt \
+            or args["launchConfigId"] != PONS_LAUNCH_CONFIG_ID or Web3.to_checksum_address(args["pairToken"]) != pair:
+        sys.exit("encoded launchToken calldata does not round-trip to the intended parameters")
+    log(f"calldata verified: launchToken({name}/{symbol}, logo {logo_uri}, twitter {socials[0] or '-'}, "
+        f"creatorFeeRecipient {acct.address}, creatorTax {CREATOR_TAX_BPS} bps, buyback {BUYBACK_ENABLED}, "
+        f"salt {salt.hex()}) selector {data[:4].hex()}, {len(data)} bytes")
+
+    # -- simulate, price, (broadcast) -----------------------------------------
+    tx = {"from": acct.address, "to": factory.address, "data": data, "value": fee, "chainId": w3.eth.chain_id}
     try:
         ret = w3.eth.call(tx)
     except Exception as e:  # noqa: BLE001
-        sys.exit(f"simulation of LaunchFactory.launch reverted: {e}")
-    asset, pool, gov, timelock, mig = abi_decode(["address"] * 5, ret)
-    if Web3.to_checksum_address(asset) != v["expectedAsset"]:
-        sys.exit(f"simulation returned asset {asset}, expected {v['expectedAsset']}")
+        sys.exit(f"simulation of PonsV2LaunchFactory.launchToken reverted: {decode_revert(e)}")
+    token, curve = abi_decode(["address", "address"], ret)
+    token, curve = Web3.to_checksum_address(token), Web3.to_checksum_address(curve)
     gas = w3.eth.estimate_gas(tx)
     gas_price = buffered_gas_price(w3)
     cost = gas * gas_price
     balance = w3.eth.get_balance(acct.address)
-    log(f"launch: simulated ok -> asset {asset}, pool/hook {pool}; gas estimate {gas}, "
-        f"gas price (buffered) {w3.from_wei(gas_price, 'gwei')} gwei, max cost ~{w3.from_wei(cost * 12 // 10, 'ether')} ETH")
-    if balance < cost * 12 // 10:
-        sys.exit("insufficient ETH for gas; fund the wallet and retry")
+    log(f"launch: simulated ok -> token {token}, curve {curve}; gas estimate {gas}, "
+        f"gas price (buffered) {w3.from_wei(gas_price, 'gwei')} gwei, max cost ~{w3.from_wei(cost * 12 // 10 + fee, 'ether')} ETH "
+        f"(incl. {w3.from_wei(fee, 'ether')} ETH launch fee)")
+    if balance < cost * 12 // 10 + fee:
+        sys.exit("insufficient ETH for gas + launch fee; fund the wallet and retry")
 
+    result = {"tx": None, "asset": token, "curve": curve, "logo": logo_uri, "salt": salt.hex(),
+              "fee": fee, "economics": economics.hex()}
     if dry_run:
         log("launch: dry run, transaction NOT sent")
-        return {"tx": None, "asset": asset, "pool": pool, "tokenURI": v["tokenURI"]}
+        return result
 
     tx.update({"nonce": w3.eth.get_transaction_count(acct.address), "gas": gas * 12 // 10, "gasPrice": gas_price})
     tx_hash = send_and_wait(w3, acct, tx, "launch")
-    log(f"launched {v['symbol']} asset {asset} with pool/hook {pool}")
-    return {"tx": tx_hash, "asset": asset, "pool": pool, "tokenURI": v["tokenURI"]}
+    receipt = w3.eth.get_transaction_receipt(tx_hash)
+    launched = [ev for ev in factory.events.TokenLaunched().process_receipt(receipt)
+                if ev["address"].lower() == factory.address.lower()]
+    if not launched:
+        sys.exit(f"launch tx {tx_hash} succeeded but emitted no TokenLaunched from the factory")
+    ev = launched[0]["args"]
+    if Web3.to_checksum_address(ev["token"]) != token:
+        log(f"warning: TokenLaunched.token {ev['token']} != simulated {token}; recording the on-chain one")
+        token, curve = Web3.to_checksum_address(ev["token"]), Web3.to_checksum_address(ev["curve"])
+    log(f"launched {symbol} token {token} with bonding curve {curve}")
+    result.update({"tx": tx_hash, "asset": token, "curve": curve})
+    return result
 
 
 def append_launch_record(digest: str, anchor_hash: str, result: dict, sender: str) -> None:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     entry = f"""
-## {stamp} — {TOKEN_SYMBOL} via launchpad factory
+## {stamp} — {TOKEN_SYMBOL} via Pons V2 PonsV2LaunchFactory (paired with ETH)
 
 | Field | Value |
 |---|---|
@@ -622,14 +541,16 @@ def append_launch_record(digest: str, anchor_hash: str, result: dict, sender: st
 | Anchor tx | `{anchor_hash}` |
 | Launch tx | `{result['tx']}` |
 | Token | `{result['asset']}` — {TOKEN_NAME} / {TOKEN_SYMBOL} |
-| Pool / hook | `{result['pool']}` |
-| tokenURI | `{result['tokenURI']}` |
-| Launcher | `{LONG_LAUNCHER}` |
+| Bonding curve | `{result['curve']}` |
+| Logo | `{result['logo']}` (on-chain `logo()`), twitter {x_profile_url(TOKEN_TWITTER)} |
+| Launch fee | {Web3.from_wei(result['fee'], 'ether')} ETH, expectedEconomics `{result['economics']}`, salt `{result['salt']}` |
+| Factory | `{PONS_FACTORY}` (launchConfigId {PONS_LAUNCH_CONFIG_ID}, pairToken `{PAIR_TOKEN}`) |
 | Explorer | {EXPLORER_TX}{result['tx']} |
 """
     with LAUNCH_RECORD.open("a") as f:
         f.write(entry)
     log(f"appended launch record to {LAUNCH_RECORD.relative_to(ROOT)}")
+
 
 
 # --------------------------------------------------------------------------- #
@@ -663,6 +584,8 @@ def main() -> None:
     print(f"anchor tx    : {anchor_hash or '(dry run, not sent)'}")
     print(f"launch tx    : {result['tx'] or '(dry run, not sent)'}")
     print(f"token        : {result['asset']}")
+    print(f"curve        : {result['curve']}")
+    print(f"logo         : {result['logo']}")
     if anchor_hash:
         print(f"anchor url   : {EXPLORER_TX}{anchor_hash}")
     if result["tx"]:
