@@ -9,13 +9,15 @@ after the Lean proof in qed/Qed/Basic.lean is verified.
 Pipeline
   1. aristotle submit ... --wait      (prove / re-verify the rules in Basic.lean)
   2. lake build in qed/               (must succeed with no errors, no sorry)
-  3. 0-value self-tx with the proof's SHA-256 as calldata (anchor), wait for it
+  3. 0-value self-tx whose calldata is the FULL UTF-8 text of Qed/Basic.lean (anchor);
+     wait for it. The SHA-256 is printed separately for the record.
   4. Pons V2 launch, the way www.ponsfamily.com/launchpad/create does it:
        a. POST the logo (multipart field "image") to the site's IPFS worker
           -> {"uri": "ipfs://<cid>"}; the URI is stored on-chain in the token
        b. read launchFee / canLaunch / getLaunchConfig(0) /
           previewLaunchEconomics(0, ETH) from PonsV2LaunchFactory
-       c. build PonsV2LaunchFactory.launchToken(TokenParams, 0, address(0), [])
+       c. build PonsV2LaunchFactory.launchToken(TokenParams, 0, address(0), []);
+          the on-chain description names the proof hash and the anchor tx
           locally (no backend, no signed authorization; the site calls the
           factory straight from the wallet), value = launchFee
        d. simulate it (eth_call), then broadcast
@@ -101,9 +103,11 @@ X_HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 DESCRIPTION_MAX = 256                                          # and no links
 
 # Token to launch
-TOKEN_NAME = "test3"
-TOKEN_SYMBOL = "TEST3"
-TOKEN_DESCRIPTION = "test3: a deploy-by-proof test token. Launch gated on a machine-checked Lean proof."
+TOKEN_NAME = "test4"
+TOKEN_SYMBOL = "TEST4"
+# Filled at runtime once the anchor tx has confirmed (see build_description).
+TOKEN_DESCRIPTION_TEMPLATE = ("deploy-by-proof. Proof SHA-256: {digest}. "
+                              "Full proof on-chain in tx {anchor}. No proof, no launch.")
 TOKEN_TWITTER = ""  # optional X handle or URL; stored on-chain as https://x.com/<handle> like the site does
 TOKEN_IMAGE = ROOT / "logo.png"  # a placeholder is generated only if this file is missing
 IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
@@ -331,9 +335,11 @@ def send_and_wait(w3, acct, tx: dict, label: str) -> str:
 
 
 def anchor_proof(w3, acct, digest: str, dry_run: bool) -> str | None:
-    """0-value self-transfer whose calldata is the raw 32-byte SHA-256 of the proof."""
-    data = bytes.fromhex(digest)
-    assert len(data) == 32
+    """0-value self-transfer whose calldata is the full UTF-8 text of Qed/Basic.lean."""
+    data = PROOF_FILE.read_bytes()
+    data.decode("utf-8")  # must be valid UTF-8; raises otherwise
+    if hashlib.sha256(data).hexdigest() != digest:
+        sys.exit("proof file changed between verification and anchoring; refusing")
     tx = {
         "from": acct.address,
         "to": acct.address,
@@ -344,7 +350,8 @@ def anchor_proof(w3, acct, digest: str, dry_run: bool) -> str | None:
     gas = w3.eth.estimate_gas(tx)
     tx["gas"] = gas * 12 // 10
     tx["gasPrice"] = buffered_gas_price(w3)
-    log(f"anchor: 0 ETH self-transfer carrying sha256 {digest}; gas estimate {gas}")
+    log(f"anchor: 0 ETH self-transfer carrying the full {PROOF_FILE.relative_to(ROOT)} "
+        f"({len(data)} bytes); sha256 {digest}; gas estimate {gas}")
     if dry_run:
         log("anchor: dry run, transaction NOT sent")
         return None
@@ -385,9 +392,16 @@ def x_profile_url(handle_or_url: str) -> str:
     return f"https://x.com/{h}"
 
 
-def validate_token_identity() -> tuple[str, str, str]:
+def build_description(digest: str, anchor_hash: str | None) -> str:
+    """Runtime description: proof hash + the anchor tx that carries the full proof text."""
+    anchor = "(dry run, anchor not sent)" if anchor_hash is None else \
+        (anchor_hash if anchor_hash.startswith("0x") else "0x" + anchor_hash)
+    return TOKEN_DESCRIPTION_TEMPLATE.format(digest=digest, anchor=anchor)
+
+
+def validate_token_identity(description: str) -> tuple[str, str, str]:
     """The checks the site's form applies before it lets you submit."""
-    name, symbol, desc = TOKEN_NAME.strip(), TOKEN_SYMBOL.strip().upper(), TOKEN_DESCRIPTION.strip()
+    name, symbol, desc = TOKEN_NAME.strip(), TOKEN_SYMBOL.strip().upper(), description.strip()
     if not (0 < len(name) <= 32 and NAME_RE.fullmatch(name)):
         sys.exit("Token names must use letters, numbers, and spaces with at most 32 characters.")
     if not (0 < len(symbol) <= 10 and SYMBOL_RE.fullmatch(symbol)):
@@ -430,7 +444,7 @@ def decode_revert(err: Exception) -> str:
     return msg[:400]
 
 
-def launch(w3, acct, dry_run: bool) -> dict:
+def launch(w3, acct, dry_run: bool, digest: str, anchor_hash: str | None) -> dict:
     factory = w3.eth.contract(address=Web3.to_checksum_address(PONS_FACTORY), abi=PONS_FACTORY_ABI)
     pair = Web3.to_checksum_address(PAIR_TOKEN)
     if len(w3.eth.get_code(factory.address)) == 0:
@@ -465,7 +479,8 @@ def launch(w3, acct, dry_run: bool) -> dict:
     log(f"pons: expectedEconomics {economics.hex()}")
 
     # -- metadata: on-chain strings, logo via the site's IPFS worker ----------
-    name, symbol, desc = validate_token_identity()
+    name, symbol, desc = validate_token_identity(build_description(digest, anchor_hash))
+    log(f"description: {desc}")
     if not TOKEN_IMAGE.exists():
         placeholder_png(TOKEN_IMAGE)
         log(f"generated placeholder image {TOKEN_IMAGE.name}")
@@ -508,7 +523,7 @@ def launch(w3, acct, dry_run: bool) -> dict:
         sys.exit("insufficient ETH for gas + launch fee; fund the wallet and retry")
 
     result = {"tx": None, "asset": token, "curve": curve, "logo": logo_uri, "salt": salt.hex(),
-              "fee": fee, "economics": economics.hex()}
+              "fee": fee, "economics": economics.hex(), "description": desc}
     if dry_run:
         log("launch: dry run, transaction NOT sent")
         return result
@@ -538,9 +553,10 @@ def append_launch_record(digest: str, anchor_hash: str, result: dict, sender: st
 |---|---|
 | Proof SHA-256 | `{digest}` |
 | Sender | `{sender}` |
-| Anchor tx | `{anchor_hash}` |
+| Anchor tx (0 ETH self-transfer, calldata = full `Qed/Basic.lean` text) | `{anchor_hash}` |
 | Launch tx | `{result['tx']}` |
 | Token | `{result['asset']}` — {TOKEN_NAME} / {TOKEN_SYMBOL} |
+| Description (on-chain) | {result['description']} |
 | Bonding curve | `{result['curve']}` |
 | Logo | `{result['logo']}` (on-chain `logo()`), twitter {x_profile_url(TOKEN_TWITTER)} |
 | Launch fee | {Web3.from_wei(result['fee'], 'ether')} ETH, expectedEconomics `{result['economics']}`, salt `{result['salt']}` |
@@ -573,7 +589,7 @@ def main() -> None:
 
     w3, acct = connect(private_key)
     anchor_hash = anchor_proof(w3, acct, digest, args.dry_run)
-    result = launch(w3, acct, args.dry_run)
+    result = launch(w3, acct, args.dry_run, digest, anchor_hash)
     if result["tx"] and anchor_hash:
         append_launch_record(digest, anchor_hash, result, acct.address)
 
