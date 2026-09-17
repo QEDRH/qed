@@ -1,1 +1,1 @@
-import Qed.Basic
+import Qed.Rules

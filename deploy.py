@@ -4,20 +4,19 @@
 # ///
 """
 deploy-by-proof: launch a token on Pons V2 (ponsfamily.com, Robinhood Chain) ONLY
-after the Lean proof in qed/Qed/Basic.lean is verified.
+after the Lean proof in qed/Qed/Rules.lean is verified.
 
 Pipeline
-  1. aristotle submit ... --wait      (prove / re-verify the rules in Basic.lean)
+  1. aristotle submit ... --wait      (prove / re-verify the rules in Rules.lean)
   2. lake build in qed/               (must succeed with no errors, no sorry)
-  3. 0-value self-tx whose calldata is the FULL UTF-8 text of Qed/Basic.lean (anchor);
+  3. 0-value self-tx whose calldata is the FULL UTF-8 text of Qed/Rules.lean (anchor);
      wait for it. The SHA-256 is printed separately for the record.
   4. Pons V2 launch, the way www.ponsfamily.com/launchpad/create does it:
        a. POST the logo (multipart field "image") to the site's IPFS worker
           -> {"uri": "ipfs://<cid>"}; the URI is stored on-chain in the token
        b. read launchFee / canLaunch / getLaunchConfig(0) /
           previewLaunchEconomics(0, ETH) from PonsV2LaunchFactory
-       c. build PonsV2LaunchFactory.launchToken(TokenParams, 0, address(0), []);
-          the on-chain description names the proof hash and the anchor tx
+       c. build PonsV2LaunchFactory.launchToken(TokenParams, 0, address(0), [])
           locally (no backend, no signed authorization; the site calls the
           factory straight from the wallet), value = launchFee
        d. simulate it (eth_call), then broadcast
@@ -29,12 +28,13 @@ and exits non-zero WITHOUT sending any transaction.
 Usage
   uv run deploy.py                   # full pipeline, sends anchor + launch
   uv run deploy.py --dry-run         # everything except broadcasting (eth_call only)
-  uv run deploy.py --skip-aristotle  # reuse the proof already in qed/Qed/Basic.lean
+  uv run deploy.py --skip-aristotle  # reuse the proof already in qed/Qed/Rules.lean
 
 Environment
   PRIVATE_KEY        required; the launching wallet's key, 0x-prefixed 32-byte hex.
                      This public copy reads it from the process environment only
                      and never writes or logs it. Use a dedicated burner wallet.
+  ARISTOTLE_API_KEY  required for step 1 (the Aristotle CLI reads it).
 """
 
 from __future__ import annotations
@@ -64,7 +64,12 @@ from web3 import Web3
 
 ROOT = Path(__file__).resolve().parent
 QED_DIR = ROOT / "qed"
-PROOF_FILE = QED_DIR / "Qed" / "Basic.lean"
+PROOF_FILE = QED_DIR / "Qed" / "Rules.lean"
+PROOF_MODULE = "Qed.Rules"
+PROOF_NAMESPACE = "QED"
+# Every one of these must be stated in Rules.lean, build without sorry, and use only standard axioms.
+REQUIRED_THEOREMS = ["QED.no_mint", "QED.conservation", "QED.supply_le_initial",
+                     "QED.burn_exact", "QED.fee_is_one_percent", "QED.fee_le_amount"]
 LAUNCH_RECORD = QED_DIR / "LAUNCH_RECORD.md"
 
 # Robinhood Chain (Arbitrum Orbit, gas token ETH)
@@ -83,7 +88,7 @@ PONS_MEME_HOOK = "0xE5e702641Ea86F4ae6cC3cDaeD2B886f976Be044"        # PonsV2Mem
 PONS_LAUNCH_AND_BUY_ROUTER = "0xe33E9E479dF8802cb0866d5d05258bEc4cF62948"  # site uses it only for a dev buy; unused here
 PONS_LAUNCH_CONFIG_ID = 0   # the site always passes 0: 1e9 supply, 1% curve fee, 4.2 ETH graduation
 PAIR_TOKEN = "0x0000000000000000000000000000000000000000"  # address(0) = native ETH quote (site default)
-CREATOR_TAX_BPS = 0         # site default (extra creator tax slider at 0); capped on-chain by maxCreatorTaxBps
+CREATOR_TAX_BPS = 100       # 1% extra creator tax on every trade (site slider); capped on-chain by maxCreatorTaxBps
 BUYBACK_ENABLED = False     # the site always sends false
 SNIPE_TAX_EXEMPTIONS: list[str] = []  # extra wallets; the sender is exempted on-chain automatically
 
@@ -103,12 +108,16 @@ X_HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 DESCRIPTION_MAX = 256                                          # and no links
 
 # Token to launch
-TOKEN_NAME = "test4"
-TOKEN_SYMBOL = "TEST4"
-# Filled at runtime once the anchor tx has confirmed (see build_description).
-TOKEN_DESCRIPTION_TEMPLATE = ("deploy-by-proof. Proof SHA-256: {digest}. "
-                              "Full proof on-chain in tx {anchor}. No proof, no launch.")
-TOKEN_TWITTER = ""  # optional X handle or URL; stored on-chain as https://x.com/<handle> like the site does
+TOKEN_NAME = "QED"
+TOKEN_SYMBOL = "QED"
+# Used verbatim as the Pons on-chain description: no proof hash, no anchor tx (see build_description).
+TOKEN_DESCRIPTION_TEMPLATE = ("The world's first coin launched by Aristotle, the mathematical superintelligence "
+                              "from Vlad Tenev's second company, Harmonic.")
+TOKEN_TWITTER = "https://x.com/QEDRH"  # optional handle or URL, stored on-chain as https://x.com/<handle> like the site does
+# Stored on-chain in socials.website (readable via token.socials()), but ponsfamily.com never
+# displays it: the create page always sends website "", and the token page only renders the
+# twitter / telegram / discord / farcaster slots (checked against the site bundle, 2026-09-17).
+TOKEN_WEBSITE = "https://deploybyproof.com"  # optional
 TOKEN_IMAGE = ROOT / "logo.png"  # a placeholder is generated only if this file is missing
 IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
 
@@ -163,10 +172,10 @@ PONS_ERRORS = {Web3.keccak(text=sig)[:4].hex().removeprefix("0x"): sig for sig i
     "ExemptionListTooLong()", "GraduationSeedNotViable()", "FeeTransferFailed()", "ReentrancyGuardReentrantCall()",
 )}
 
-# Aristotle prompt: re-verify the rules already stated in Basic.lean
+# Aristotle prompt: re-verify the rules already stated in Rules.lean
 ARISTOTLE_PROMPT = (
     "Verify and, if necessary, complete the proofs of every theorem in "
-    "Qed/Basic.lean. Do not change any definition or theorem statement. "
+    "Qed/Rules.lean. Do not change any definition or theorem statement. "
     "The file must build with no errors, no sorry, and no additional axioms."
 )
 
@@ -237,9 +246,9 @@ def run_aristotle() -> None:
             die_no_proof("aristotle finished but produced no result archive")
 
         with tarfile.open(archive) as tf:
-            members = [m for m in tf.getmembers() if m.name.endswith("Qed/Basic.lean")]
+            members = [m for m in tf.getmembers() if m.name.endswith("Qed/Rules.lean")]
             if not members:
-                die_no_proof("result archive has no Qed/Basic.lean")
+                die_no_proof("result archive has no Qed/Rules.lean")
             tf.extractall(tmp, members=members, filter="data")
             extracted = Path(tmp) / members[0].name
 
@@ -259,22 +268,26 @@ def check_proof() -> str:
     src = PROOF_FILE.read_text()
     if re.search(r"\bsorry\b", src):
         die_no_proof("proof file contains `sorry`")
-    if not re.search(r"^\s*theorem\s+le_initialValue\b", src, re.M):
-        die_no_proof("proof file no longer states theorem le_initialValue")
+    if not re.search(rf"^\s*namespace\s+{re.escape(PROOF_NAMESPACE)}\b", src, re.M):
+        die_no_proof(f"proof file does not open namespace {PROOF_NAMESPACE}")
+    for thm in REQUIRED_THEOREMS:
+        short = thm.split(".", 1)[1]
+        if not re.search(rf"^\s*theorem\s+{re.escape(short)}\b", src, re.M):
+            die_no_proof(f"proof file no longer states theorem {thm}")
 
     log("running lake build in qed/ ...")
     proc = subprocess.run(["lake", "build"], cwd=QED_DIR, text=True, capture_output=True)
     out = proc.stdout + proc.stderr
     if proc.returncode != 0:
         die_no_proof(f"lake build exited {proc.returncode}\n{out[-2000:]}")
-    if re.search(r"^error:|\berror\b.*Qed/Basic\.lean", out, re.M | re.I):
+    if re.search(r"^error:|\berror\b.*Qed/Rules\.lean", out, re.M | re.I):
         die_no_proof(f"lake build reported errors\n{out[-2000:]}")
-    if "declaration uses 'sorry'" in out:
+    if re.search(r"declaration uses ['`]sorry['`]", out):
         die_no_proof("lake build reports a declaration uses sorry")
 
     # Axiom audit: only the three standard Lean axioms are allowed.
     with tempfile.NamedTemporaryFile("w", suffix=".lean", dir=QED_DIR, delete=False) as f:
-        f.write("import Qed.Basic\n#print axioms Qed.le_initialValue\n")
+        f.write(f"import {PROOF_MODULE}\n" + "".join(f"#print axioms {thm}\n" for thm in REQUIRED_THEOREMS))
         probe = Path(f.name)
     try:
         ax = subprocess.run(["lake", "env", "lean", str(probe)], cwd=QED_DIR, text=True, capture_output=True)
@@ -284,8 +297,13 @@ def check_proof() -> str:
     if ax.returncode != 0:
         die_no_proof(f"axiom probe failed\n{ax_out[-1000:]}")
     allowed = {"propext", "Classical.choice", "Quot.sound"}
-    m = re.search(r"depends on axioms: \[(.*?)\]", ax_out, re.S)
-    used = {a.strip() for a in m.group(1).split(",")} if m else set()
+    used: set[str] = set()
+    for thm in REQUIRED_THEOREMS:
+        m = re.search(rf"'{re.escape(thm)}' (?:depends on axioms: \[(.*?)\]|does not depend on any axioms)", ax_out, re.S)
+        if not m:
+            die_no_proof(f"axiom probe has no result for {thm}\n{ax_out[-1000:]}")
+        if m.group(1):
+            used |= {a.strip() for a in m.group(1).split(",")}
     if used - allowed:
         die_no_proof(f"proof uses non-standard axioms: {sorted(used - allowed)}")
 
@@ -335,7 +353,7 @@ def send_and_wait(w3, acct, tx: dict, label: str) -> str:
 
 
 def anchor_proof(w3, acct, digest: str, dry_run: bool) -> str | None:
-    """0-value self-transfer whose calldata is the full UTF-8 text of Qed/Basic.lean."""
+    """0-value self-transfer whose calldata is the full UTF-8 text of Qed/Rules.lean."""
     data = PROOF_FILE.read_bytes()
     data.decode("utf-8")  # must be valid UTF-8; raises otherwise
     if hashlib.sha256(data).hexdigest() != digest:
@@ -392,11 +410,20 @@ def x_profile_url(handle_or_url: str) -> str:
     return f"https://x.com/{h}"
 
 
+def website_url(url: str) -> str:
+    """Optional project website for socials.website; must be a plain http(s) URL."""
+    u = url.strip()
+    if not u:
+        return ""
+    if not re.fullmatch(r"https?://[^\s]{1,200}", u):
+        sys.exit(f"TOKEN_WEBSITE {url!r} is not a valid http(s) URL")
+    return u
+
+
 def build_description(digest: str, anchor_hash: str | None) -> str:
-    """Runtime description: proof hash + the anchor tx that carries the full proof text."""
-    anchor = "(dry run, anchor not sent)" if anchor_hash is None else \
-        (anchor_hash if anchor_hash.startswith("0x") else "0x" + anchor_hash)
-    return TOKEN_DESCRIPTION_TEMPLATE.format(digest=digest, anchor=anchor)
+    """On-chain description: the fixed template, verbatim. The proof hash and anchor tx are
+    recorded in LAUNCH_RECORD.md and the anchor calldata, not in the description."""
+    return TOKEN_DESCRIPTION_TEMPLATE
 
 
 def validate_token_identity(description: str) -> tuple[str, str, str]:
@@ -485,7 +512,9 @@ def launch(w3, acct, dry_run: bool, digest: str, anchor_hash: str | None) -> dic
         placeholder_png(TOKEN_IMAGE)
         log(f"generated placeholder image {TOKEN_IMAGE.name}")
     logo_uri = upload_logo(TOKEN_IMAGE)
-    socials = (x_profile_url(TOKEN_TWITTER), "", "", "", "")  # site form: twitter, telegram; discord/website/farcaster empty
+    socials = (x_profile_url(TOKEN_TWITTER), "", "", website_url(TOKEN_WEBSITE), "")  # twitter, telegram, discord, website, farcaster
+    if socials[3]:
+        log(f"note: website {socials[3]} is stored on-chain only; the ponsfamily.com token page has no website link")
     salt = secrets.token_bytes(32)  # site: crypto.getRandomValues(32 bytes)
     params = (name, symbol, logo_uri, desc, socials, acct.address, CREATOR_TAX_BPS, BUYBACK_ENABLED, bytes(economics), salt)
     exemptions = [Web3.to_checksum_address(a) for a in SNIPE_TAX_EXEMPTIONS]
@@ -496,11 +525,11 @@ def launch(w3, acct, dry_run: bool, digest: str, anchor_hash: str | None) -> dic
     fn, args = factory.decode_function_input(data)
     p = args["params"]
     if fn.fn_name != "launch" + "Token" or p["name"] != name or p["symbol"] != symbol or p["logo"] != logo_uri \
-            or p["socials"]["twitter"] != socials[0] or Web3.to_checksum_address(p["creatorFeeRecipient"]) != acct.address \
+            or p["socials"]["twitter"] != socials[0] or p["socials"]["website"] != socials[3] or Web3.to_checksum_address(p["creatorFeeRecipient"]) != acct.address \
             or bytes(p["expectedEconomics"]) != bytes(economics) or bytes(p["salt"]) != salt \
             or args["launchConfigId"] != PONS_LAUNCH_CONFIG_ID or Web3.to_checksum_address(args["pairToken"]) != pair:
         sys.exit("encoded launchToken calldata does not round-trip to the intended parameters")
-    log(f"calldata verified: launchToken({name}/{symbol}, logo {logo_uri}, twitter {socials[0] or '-'}, "
+    log(f"calldata verified: launchToken({name}/{symbol}, logo {logo_uri}, twitter {socials[0] or '-'}, website {socials[3] or '-'}, "
         f"creatorFeeRecipient {acct.address}, creatorTax {CREATOR_TAX_BPS} bps, buyback {BUYBACK_ENABLED}, "
         f"salt {salt.hex()}) selector {data[:4].hex()}, {len(data)} bytes")
 
@@ -553,12 +582,12 @@ def append_launch_record(digest: str, anchor_hash: str, result: dict, sender: st
 |---|---|
 | Proof SHA-256 | `{digest}` |
 | Sender | `{sender}` |
-| Anchor tx (0 ETH self-transfer, calldata = full `Qed/Basic.lean` text) | `{anchor_hash}` |
+| Anchor tx (0 ETH self-transfer, calldata = full `Qed/Rules.lean` text) | `{anchor_hash}` |
 | Launch tx | `{result['tx']}` |
 | Token | `{result['asset']}` — {TOKEN_NAME} / {TOKEN_SYMBOL} |
 | Description (on-chain) | {result['description']} |
 | Bonding curve | `{result['curve']}` |
-| Logo | `{result['logo']}` (on-chain `logo()`), twitter {x_profile_url(TOKEN_TWITTER)} |
+| Logo | `{result['logo']}` (on-chain `logo()`), twitter {x_profile_url(TOKEN_TWITTER) or '-'}, website {website_url(TOKEN_WEBSITE) or '-'} |
 | Launch fee | {Web3.from_wei(result['fee'], 'ether')} ETH, expectedEconomics `{result['economics']}`, salt `{result['salt']}` |
 | Factory | `{PONS_FACTORY}` (launchConfigId {PONS_LAUNCH_CONFIG_ID}, pairToken `{PAIR_TOKEN}`) |
 | Explorer | {EXPLORER_TX}{result['tx']} |

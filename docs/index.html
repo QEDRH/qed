@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Proof → Stamp → Coin.</title>
-<meta name="description" content="Verify the test2 launch: a Lean proof, its SHA-256 fingerprint stamped on Robinhood Chain, then the launchpad launch.">
+<title>Proof → Stamp → Coin. (rehearsal)</title>
+<meta name="description" content="Rehearsal for QED. Verify the test2 launch: a Lean proof, its SHA-256 fingerprint stamped on Robinhood Chain, then the launchpad launch.">
 <style>
   :root { color-scheme: dark; --bg:#000; --fg:#e6e6e6; --dim:#8b949e; --line:#262c33; --ok:#3fb950; --bad:#f85149; --link:#79c0ff; --card:#0a0c0f; }
   * { box-sizing: border-box; }
@@ -37,10 +37,10 @@
 <body>
 <main>
   <h1>Proof → Stamp → Coin.</h1>
-  <p class="sub">test2 / $TESTII on Robinhood Chain (chain id 4663). A machine-checked Lean proof was hashed, the hash was stamped on-chain, and only then was the token launched.</p>
+  <p class="sub"><b>Rehearsal, not QED.</b> This page verifies a throwaway test token launched to exercise the pipeline before QED. QED's rules are in <a href="https://github.com/QEDRH/qed/blob/main/Qed/Rules.lean" target="_blank" rel="noopener">Qed/Rules.lean</a>.<br>test2 / $TESTII on Robinhood Chain (chain id 4663). A machine-checked Lean proof was hashed, the hash was stamped on-chain, and only then was the token launched.</p>
 
   <section id="proof">
-    <h2><span class="n">1</span>The proof: <code>Qed/Basic.lean</code></h2>
+    <h2><span class="n">1</span>The rehearsal proof file <span class="dim">(since replaced by <code>Qed/Rules.lean</code>)</span></h2>
     <pre id="proof-view"></pre>
     <script type="text/plain" id="proof-src">import Mathlib
 
@@ -118,7 +118,7 @@ end Qed
   </section>
 
   <section id="aristotle">
-    <h2><span class="n">5</span>Aristotle (Harmonic) verification</h2>
+    <h2><span class="n">5</span>Aristotle (Harmonic) verification <span class="dim">(quoted as written at the time)</span></h2>
     <div class="kv">
       <div class="k">task, original proof</div><div class="v">b4751aa7-9d44-42ea-a20f-b9a52f74f07d <span class="dim">project cc840c38-fef3-47f2-943f-3d5ea124127d</span></div>
     </div>
@@ -132,9 +132,9 @@ end Qed
   <section id="pipeline">
     <h2><span class="n">6</span>The pipeline: <a href="https://github.com/QEDRH/qed/blob/main/deploy.py" target="_blank" rel="noopener">deploy.py</a></h2>
     <ol class="steps">
-      <li><b>prove</b> submit <code>Qed/Basic.lean</code> to Aristotle and wait for the verified file</li>
+      <li><b>prove</b> submit the rules file (now <code>Qed/Rules.lean</code>) to Aristotle and wait for the verified file</li>
       <li><b>check</b> <code>lake build</code> must pass with no errors, no <code>sorry</code>, standard axioms only — otherwise <span class="dim">"no proof, no launch."</span></li>
-      <li><b>stamp</b> send a 0-value self-transaction carrying the file's SHA-256 as calldata and wait for it to confirm</li>
+      <li><b>stamp</b> send a 0-value self-transaction carrying the proof as calldata and wait for it to confirm (this rehearsal stamped the file's SHA-256; the pipeline now stamps the full file text)</li>
       <li><b>launch</b> build the launch call, verify the calldata locally, simulate, then broadcast</li>
     </ol>
   </section>
